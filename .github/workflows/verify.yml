@@ -1,0 +1,38 @@
+name: verified-build
+
+# Reproducible build of the on-chain program with solana-verify (Docker, which
+# GitHub-hosted runners provide). Proves the source in this repo builds
+# deterministically and prints the executable hash. The on-chain
+# verify-from-repo (matching the deployed program) is run once the program is
+# deployed from a build of this repo — see the README.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+          key: ${{ runner.os }}-solana-verify
+
+      - name: Install solana-verify
+        run: cargo install solana-verify --locked || true
+
+      - name: Reproducible build (Docker)
+        run: solana-verify build --library-name blocfone_market
+
+      - name: Executable hash
+        run: |
+          echo "Program: blocfone_market (6aYP8MQt44Zn91McAT7BU4gfoFoGxZ8H1jdNJuFVnS9R)"
+          solana-verify get-executable-hash target/deploy/blocfone_market.so

@@ -1,0 +1,22 @@
+# Minimal Anchor manifest for a reproducible/verified build of the marketplace
+# program. The private monorepo's Anchor.toml also carries localnet test-genesis
+# fixtures; those are omitted here because this public repo builds the program
+# only. `anchor build` will regenerate a throwaway program keypair and overwrite
+# declare_id/this file unless the real program keypair is at
+# target/deploy/blocfone_market-keypair.json — reproducible verification uses
+# `solana-verify build`, which does not touch declare_id.
+[toolchain]
+anchor_version = "1.1.2"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.mainnet]
+blocfone_market = "6aYP8MQt44Zn91McAT7BU4gfoFoGxZ8H1jdNJuFVnS9R"
+
+[provider]
+cluster = "mainnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
