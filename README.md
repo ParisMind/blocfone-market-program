@@ -46,5 +46,7 @@ https://blocfone.com/privacy-cookie-policy/
 
 ## Licence
 
-A licence will be added to this repository. Until then, all rights reserved; the
-source is published for transparency and verification.
+See [`LICENSE`](LICENSE). Source-available, all rights reserved: the code is
+published for transparency and reproducible verification, not for reuse. It
+implements inventions covered by U.S. Patent No. 10,915,873 and European Patent
+No. EP 3 542 333; no patent rights are granted or waived.
