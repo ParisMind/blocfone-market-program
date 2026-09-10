@@ -41,3 +41,10 @@ jobs:
         run: |
           echo "Program: blocfone_market (6aYP8MQt44Zn91McAT7BU4gfoFoGxZ8H1jdNJuFVnS9R)"
           solana-verify get-executable-hash target/deploy/blocfone_market.so
+
+      - name: Upload verified .so (for the on-chain upgrade)
+        uses: actions/upload-artifact@v4
+        with:
+          name: blocfone_market-verified-so
+          path: target/deploy/blocfone_market.so
+          if-no-files-found: error
