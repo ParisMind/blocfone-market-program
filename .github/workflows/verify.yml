@@ -30,7 +30,12 @@ jobs:
         run: cargo install solana-verify --locked || true
 
       - name: Reproducible build (Docker)
-        run: solana-verify build --library-name blocfone_market
+        # Pin the verifiable-build image to a 4.1.x Agave (matches the local
+        # toolchain and ships Rust >= 1.85, which the Solana crypto stack's
+        # edition2024 crates require; the default image was Cargo 1.84 and
+        # failed on zeroize_derive 1.5.0). This exact image is also what the
+        # eventual on-chain verify must use.
+        run: solana-verify build --base-image solanafoundation/solana-verifiable-build:4.1.1 --library-name blocfone_market
 
       - name: Executable hash
         run: |
