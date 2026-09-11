@@ -21,20 +21,27 @@ holds funds itself except through the settlement vault.
 
 ## Reproducible / verified build
 
-Requires Docker.
+✅ **Verified on mainnet (2026-09-11).** The deployed program matches this source:
+OtterSec reports `is_verified: true`, on-chain executable hash
+`69ea40e299a440285e11fd6cb0d8e9acddf1a7d5dc33ce032f2479c923363f14`, built with
+base image `solanafoundation/solana-verifiable-build:4.1.1`. Status:
+https://verify.osec.io/status/6aYP8MQt44Zn91McAT7BU4gfoFoGxZ8H1jdNJuFVnS9R
+
+Reproduce the build yourself (requires Docker):
 
 ```bash
 cargo install solana-verify --locked
-solana-verify build --library-name blocfone_market
+solana-verify build --base-image solanafoundation/solana-verifiable-build:4.1.1 --library-name blocfone_market
 solana-verify get-executable-hash target/deploy/blocfone_market.so
 ```
 
-To verify the on-chain program against this source (after the program is
-deployed from a build of this repo):
+The on-chain verification was registered with:
 
 ```bash
-solana-verify verify-from-repo -um \
+solana-verify verify-from-repo \
   --program-id 6aYP8MQt44Zn91McAT7BU4gfoFoGxZ8H1jdNJuFVnS9R \
+  --library-name blocfone_market \
+  --base-image solanafoundation/solana-verifiable-build:4.1.1 \
   https://github.com/ParisMind/blocfone-market-program
 ```
 
