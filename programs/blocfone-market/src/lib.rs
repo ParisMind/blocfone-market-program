@@ -61,6 +61,25 @@
 //     The escrow is never CPI'd; the deposit instruction stays byte-identical
 //     to what production wallets sign today. Order lands as Funded.
 //
+// SIMPLE SEND (2026-09-15, owner plan v4) — open_claimed_order.
+//   The buyer's own transaction is now a plain USDC transfer into a vault the
+//   escrow program announced (`open_escrow`, status Pending). Blocfone's
+//   oracle then sends ONE transaction: escrow `claim` (Pending → Funded) and
+//   this program's `open_claimed_order`. The ADR-013 seam changes shape:
+//   instead of scanning the Instructions sysvar for a same-transaction
+//   deposit, open_claimed_order READS THE ESCROW ACCOUNT and refuses unless
+//   it is a Funded escrow of the configured program for (buyer, order_id)
+//   with amount == price, the configured mint, the settlement vault as
+//   beneficiary, the oracle as authority and a real deadline. Order and
+//   deposit are bound by derived address (escrow PDA = f(buyer, order_id)),
+//   by the memo / reference key in the buyer's transfer, and by the deposit
+//   signature stamped on the Order itself (deposit_signature, appended last)
+//   and in the OrderOpened event. Owner decision 2026-09-15: every order
+//   opened before the field existed is a test order, so growing the record
+//   is accepted; those accounts are no longer readable by this build.
+//   `open_order` (the sysvar-paired ritual) is kept untouched as the rollback
+//   path: the orders service picks the ritual, a program redeploy does not.
+//
 // Stake is declared now (claim element: provider skin-in-the-game) but stays 0
 // until P2-05 — the slash-policy ADR gates any instruction that moves it.
 
@@ -504,6 +523,115 @@ pub mod blocfone_market {
         order.settled_at = 0; // stamped by the terminal instruction (ADR-018)
         order.delivery_commitment = [0u8; 32]; // stamped at attestation (ADR-020)
         order.paid_out = false;
+        order.deposit_signature = [0u8; 64]; // the deposit is this very transaction
+        Ok(())
+    }
+
+    /// Simple send (2026-09-15): open an order over an escrow that is ALREADY
+    /// Funded — claimed by the oracle from the buyer's plain transfer, in this
+    /// same transaction or an earlier one. Gates 0–2 are open_order's; gate 3
+    /// reads the escrow account instead of the Instructions sysvar. The buyer
+    /// does not sign: their consent is the transfer (and the consent message,
+    /// ADR-016); the Order PDA is still seeded by their key.
+    pub fn open_claimed_order(
+        ctx: Context<OpenClaimedOrder>,
+        order_id: u64,
+        offer_hash: [u8; 32],
+        price: u64,
+        trace_id: [u8; 16],
+        proof: Vec<[u8; 32]>,
+        duration_days: u16,
+        provider_price: u64,
+        deposit_signature: [u8; 64],
+    ) -> Result<()> {
+        let batch = &ctx.accounts.batch;
+        let config = &ctx.accounts.config;
+        let buyer = ctx.accounts.buyer.key();
+        let clock = Clock::get()?;
+
+        // Gate 0 — only the configured oracle opens orders (C2), exactly as
+        // in open_order. Here it is also the escrow's claimant.
+        require!(ctx.accounts.payer.key() == config.oracle, MarketError::Unauthorized);
+        require!(
+            ctx.accounts.provider.status == ProviderStatus::Active,
+            MarketError::ProviderNotActive
+        );
+
+        // Gate 1 — the batch is usable now.
+        require!(batch.state == BatchState::Active, MarketError::BatchNotActive);
+        require!(
+            clock.slot >= batch.valid_from_slot && clock.slot <= batch.valid_until_slot,
+            MarketError::BatchWindowClosed
+        );
+
+        // Gate 2 — the offer is genuinely in the batch.
+        require!(offer_hash != [0u8; 32], MarketError::InvalidOfferHash);
+        require!(price > 0, MarketError::InvalidPrice);
+        require!(
+            duration_days >= 1 && duration_days <= 366,
+            MarketError::InvalidDuration
+        );
+        require!(proof.len() <= 32, MarketError::ProofTooLong);
+        require!(
+            verify_merkle_proof(&batch.merkle_root, &offer_hash, &proof),
+            MarketError::InvalidMerkleProof
+        );
+
+        // Gate 3' — the escrow account IS the deposit. Derived address first
+        // (a different escrow, however well-formed, is not this order's), then
+        // owner, then the state itself.
+        let expected_escrow = Pubkey::find_program_address(
+            &[b"escrow", buyer.as_ref(), &order_id.to_le_bytes()],
+            &config.escrow_program,
+        )
+        .0;
+        let escrow_ai = ctx.accounts.escrow.to_account_info();
+        require!(escrow_ai.key() == expected_escrow, MarketError::DepositEscrowMismatch);
+        require!(*escrow_ai.owner == config.escrow_program, MarketError::MissingEscrowDeposit);
+        let escrow = {
+            let data = escrow_ai.try_borrow_data()?;
+            parse_escrow(&data).ok_or(MarketError::DepositMalformed)?
+        };
+        verify_claimed_escrow(&escrow, config, &buyer, order_id, price, clock.unix_timestamp)?;
+
+        // ADR-014 stamp — identical to open_order.
+        let bps = ctx.accounts.provider.provider_share_bps;
+        require!(bps <= 10_000, MarketError::InvalidShareBps);
+        let provider_share_amount = if provider_price > 0 {
+            require!(provider_price <= price, MarketError::InvalidShareBps);
+            provider_price
+        } else {
+            ((price as u128) * (bps as u128) / 10_000u128) as u64
+        };
+
+        let order = &mut ctx.accounts.order;
+        order.buyer = buyer;
+        order.batch = batch.key();
+        order.provider = ctx.accounts.provider.key();
+        order.offer_hash = offer_hash;
+        order.price = price;
+        order.order_id = order_id;
+        order.escrow = expected_escrow;
+        order.provider_share_bps = bps;
+        order.provider_share_amount = provider_share_amount;
+        order.state = OrderState::Funded;
+        order.opened_at = clock.unix_timestamp;
+        order.trace_id = trace_id;
+        order.bump = ctx.bumps.order;
+        order.duration_days = duration_days;
+        order.settled_at = 0;
+        order.delivery_commitment = [0u8; 32];
+        order.paid_out = false;
+        order.deposit_signature = deposit_signature;
+
+        emit!(OrderOpened {
+            order_id,
+            order: order.key(),
+            buyer,
+            escrow: expected_escrow,
+            price,
+            deposit_signature,
+        });
         Ok(())
     }
 
@@ -1071,6 +1199,141 @@ mod deposit_pin_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Simple send (2026-09-15): reading the escrow account instead of the sysvar
+// ---------------------------------------------------------------------------
+
+/// The escrow program's `Escrow` account, as this program needs to read it.
+/// Layout (blocfone-escrow, rent-vault build — frozen, and asserted by the
+/// escrow's own tests): 8-byte Anchor discriminator sha256("account:Escrow")
+/// then borsh: subscriber, beneficiary, authority, mint (32 each), amount u64,
+/// order_id u64, deadline i64, status u8, bump u8 — 162 bytes in all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscrowView {
+    pub subscriber: Pubkey,
+    pub beneficiary: Pubkey,
+    pub authority: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
+    pub order_id: u64,
+    pub deadline: i64,
+    pub status: u8,
+}
+
+/// The escrow program's EscrowStatus::Funded (variant index 0). Pending, the
+/// simple-send announcement state, is 3 — an announced-but-unpaid escrow
+/// must never open an order.
+pub const ESCROW_STATUS_FUNDED: u8 = 0;
+pub const ESCROW_ACCOUNT_LEN: usize = 8 + 32 * 4 + 8 + 8 + 8 + 1 + 1;
+
+fn parse_escrow(data: &[u8]) -> Option<EscrowView> {
+    if data.len() < ESCROW_ACCOUNT_LEN {
+        return None;
+    }
+    let disc: [u8; 8] = hashv(&[b"account:Escrow"]).to_bytes()[..8].try_into().ok()?;
+    if data[..8] != disc {
+        return None;
+    }
+    let pk = |o: usize| Pubkey::new_from_array(data[o..o + 32].try_into().unwrap());
+    let u64at = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+    Some(EscrowView {
+        subscriber: pk(8),
+        beneficiary: pk(40),
+        authority: pk(72),
+        mint: pk(104),
+        amount: u64at(136),
+        order_id: u64at(144),
+        deadline: i64::from_le_bytes(data[152..160].try_into().unwrap()),
+        status: data[160],
+    })
+}
+
+/// The same pins verify_paired_deposit applies to a deposit instruction,
+/// applied to the escrow STATE — plus the one the sysvar path could not
+/// check: the escrow is Funded, i.e. the money is in the vault right now.
+fn verify_claimed_escrow(
+    e: &EscrowView,
+    config: &MarketConfig,
+    buyer: &Pubkey,
+    order_id: u64,
+    price: u64,
+    now: i64,
+) -> Result<()> {
+    let settlement_vault = Pubkey::find_program_address(&[b"settlement_vault"], &crate::ID).0;
+    require!(e.status == ESCROW_STATUS_FUNDED, MarketError::EscrowNotFunded);
+    require!(e.subscriber == *buyer, MarketError::DepositBuyerMismatch);
+    require!(e.order_id == order_id, MarketError::DepositEscrowMismatch);
+    require!(e.amount == price, MarketError::DepositAmountMismatch);
+    require!(e.mint == config.usdc_mint, MarketError::DepositMintMismatch);
+    require!(e.beneficiary == settlement_vault, MarketError::DepositBeneficiaryMismatch);
+    require!(e.authority == config.oracle, MarketError::DepositAuthorityMismatch);
+    require!(deposit_deadline_ok(e.deadline, now), MarketError::DepositDeadlineTooSoon);
+    Ok(())
+}
+
+#[cfg(test)]
+mod escrow_view_tests {
+    use super::*;
+
+    fn escrow_bytes(status: u8) -> (Vec<u8>, EscrowView) {
+        let v = EscrowView {
+            subscriber: Pubkey::new_unique(), beneficiary: Pubkey::new_unique(),
+            authority: Pubkey::new_unique(), mint: Pubkey::new_unique(),
+            amount: 1_600_000, order_id: 700_001, deadline: 1_700_086_400, status,
+        };
+        let mut d = Vec::new();
+        d.extend_from_slice(&hashv(&[b"account:Escrow"]).to_bytes()[..8]);
+        for pk in [&v.subscriber, &v.beneficiary, &v.authority, &v.mint] {
+            d.extend_from_slice(pk.as_ref());
+        }
+        d.extend_from_slice(&v.amount.to_le_bytes());
+        d.extend_from_slice(&v.order_id.to_le_bytes());
+        d.extend_from_slice(&v.deadline.to_le_bytes());
+        d.push(v.status);
+        d.push(254); // bump
+        (d, v)
+    }
+
+    #[test]
+    fn parses_the_frozen_layout_exactly() {
+        let (d, v) = escrow_bytes(0);
+        assert_eq!(d.len(), ESCROW_ACCOUNT_LEN);
+        assert_eq!(parse_escrow(&d), Some(v));
+    }
+
+    #[test]
+    fn refuses_short_data_and_foreign_discriminators() {
+        let (d, _) = escrow_bytes(0);
+        assert_eq!(parse_escrow(&d[..d.len() - 1]), None);
+        let mut wrong = d.clone();
+        wrong[0] ^= 1;
+        assert_eq!(parse_escrow(&wrong), None);
+    }
+
+    #[test]
+    fn pins_every_field_and_the_funded_state() {
+        let (_, v) = escrow_bytes(0);
+        let config = MarketConfig {
+            escrow_program: Pubkey::new_unique(), usdc_mint: v.mint, oracle: v.authority,
+            rent_collector: Pubkey::new_unique(), bump: 1,
+        };
+        let vault = Pubkey::find_program_address(&[b"settlement_vault"], &crate::ID).0;
+        let good = EscrowView { beneficiary: vault, ..v };
+        let now = good.deadline - DEPOSIT_DEADLINE_FLOOR_SECS;
+        let check = |e: &EscrowView| verify_claimed_escrow(e, &config, &good.subscriber, good.order_id, good.amount, now);
+        assert!(check(&good).is_ok());
+        assert!(check(&EscrowView { status: 3, ..good.clone() }).is_err(), "Pending must not open");
+        assert!(check(&EscrowView { status: 1, ..good.clone() }).is_err(), "Released must not open");
+        assert!(check(&EscrowView { amount: good.amount - 1, ..good.clone() }).is_err());
+        assert!(check(&EscrowView { order_id: 1, ..good.clone() }).is_err());
+        assert!(check(&EscrowView { subscriber: Pubkey::new_unique(), ..good.clone() }).is_err());
+        assert!(check(&EscrowView { mint: Pubkey::new_unique(), ..good.clone() }).is_err());
+        assert!(check(&EscrowView { beneficiary: Pubkey::new_unique(), ..good.clone() }).is_err());
+        assert!(check(&EscrowView { authority: Pubkey::new_unique(), ..good.clone() }).is_err());
+        assert!(check(&EscrowView { deadline: good.deadline - 1, ..good.clone() }).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Accounts
 // ---------------------------------------------------------------------------
 
@@ -1241,6 +1504,45 @@ pub struct OpenOrder<'info> {
     /// verify_paired_deposit to prove the escrow deposit rides this tx.
     #[account(address = ix_sysvar::ID @ MarketError::DepositMalformed)]
     pub instructions: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Simple send (2026-09-15). Same shape as OpenOrder except: the buyer is
+/// not a signer, and the escrow ACCOUNT replaces the Instructions sysvar.
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct OpenClaimedOrder<'info> {
+    /// CHECK: the customer's key — seeds the Order PDA and must equal the
+    /// escrow's subscriber (checked in the handler). Not a signer: the buyer's
+    /// act was the transfer into the vault.
+    pub buyer: UncheckedAccount<'info>,
+
+    /// The oracle: fee payer, Order rent payer, and the escrow's claimant.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, MarketConfig>,
+
+    pub batch: Account<'info, OfferBatch>,
+
+    #[account(constraint = batch.provider == provider.key() @ MarketError::BatchProviderMismatch)]
+    pub provider: Account<'info, Provider>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + Order::INIT_SPACE,
+        seeds = [b"order", buyer.key().as_ref(), &order_id.to_le_bytes()],
+        bump
+    )]
+    pub order: Account<'info, Order>,
+
+    /// CHECK: the escrow program's Escrow account for (buyer, order_id) —
+    /// address, owner and every field verified in the handler (no CPI, no
+    /// crate dependency on the escrow: the layout is frozen and parsed here).
+    pub escrow: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -1547,6 +1849,13 @@ pub struct Order {
     pub delivery_commitment: [u8; 32],
     /// ADR-014 §4: the vault has paid this order's stamps. Once, only.
     pub paid_out: bool,
+    /// Simple send (2026-09-15, owner decision): the buyer's deposit
+    /// transaction signature — the order↔payment link, on the record itself
+    /// for the whole retention window. Appended last (every earlier field
+    /// keeps its offset); orders opened before this field exists are test
+    /// orders and are not read by this build. Zeros on the legacy
+    /// `open_order` path, whose deposit IS the order's own transaction.
+    pub deposit_signature: [u8; 64],
 }
 
 /// ADR-018 §3: whether close_order may run at all. Its own PDA so the
@@ -1578,6 +1887,19 @@ pub struct ProviderShareChanged {
     pub provider: Pubkey,
     pub old_bps: u16,
     pub new_bps: u16,
+}
+
+/// Simple send (2026-09-15): the Order's opening, with the buyer's deposit
+/// transaction signature (also stamped on the Order). Only open_claimed_order
+/// emits it.
+#[event]
+pub struct OrderOpened {
+    pub order_id: u64,
+    pub order: Pubkey,
+    pub buyer: Pubkey,
+    pub escrow: Pubkey,
+    pub price: u64,
+    pub deposit_signature: [u8; 64],
 }
 
 #[event]
@@ -1729,6 +2051,9 @@ pub enum MarketError {
     NotPaidOut,
     #[msg("Payout destination must be the owner's associated token account")]
     NotAssociatedTokenAccount,
+    // ── simple send 2026-09-15 (appended; earlier codes unchanged) ──
+    #[msg("The escrow for this order is not Funded — announced but unpaid, or already settled")]
+    EscrowNotFunded,
 }
 
 #[cfg(test)]
@@ -1743,15 +2068,19 @@ mod order_layout_tests {
             offer_hash: [9u8; 32], price: 1_600_000, order_id: 42, escrow: Pubkey::new_unique(),
             provider_share_bps: 0, provider_share_amount: 1_350_000, state: OrderState::Settled,
             opened_at: 1, trace_id: [7u8; 16], bump: 255, duration_days: 7, settled_at: 2,
-            delivery_commitment: [0xd6u8; 32], paid_out: false,
+            delivery_commitment: [0xd6u8; 32], paid_out: false, deposit_signature: [0xabu8; 64],
         };
         let mut bytes = Vec::new();
         o.serialize(&mut bytes).unwrap();
-        assert_eq!(bytes.len(), 255, "Order borsh length");
-        assert_eq!(Order::INIT_SPACE, 255, "Order INIT_SPACE");
-        assert_eq!(bytes[254], 0, "paid_out serialized as the last byte, false");
+        // 255 through paid_out (the pre-simple-send record), then the 64-byte
+        // deposit signature appended last.
+        assert_eq!(bytes.len(), 319, "Order borsh length");
+        assert_eq!(Order::INIT_SPACE, 319, "Order INIT_SPACE");
+        assert_eq!(bytes[254], 0, "paid_out keeps its offset, false");
+        assert!(bytes[255..].iter().all(|b| *b == 0xab), "deposit_signature is the last 64 bytes");
         let back = Order::try_from_slice(&bytes).unwrap();
         assert!(!back.paid_out);
+        assert_eq!(back.deposit_signature, [0xabu8; 64]);
         assert!(back.state == OrderState::Settled);
     }
 }

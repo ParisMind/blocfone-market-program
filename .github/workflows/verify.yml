@@ -42,6 +42,16 @@ jobs:
           echo "Program: blocfone_market (6aYP8MQt44Zn91McAT7BU4gfoFoGxZ8H1jdNJuFVnS9R)"
           solana-verify get-executable-hash target/deploy/blocfone_market.so
 
+      # One builder (2026-09-18): VERIFIED-HASH is the executable hash the
+      # SOURCE repo's CI printed for this same source, copied here at sync time.
+      # Same source must give the same bytes; if it does not, stop.
+      - name: Hash equals the source repo's CI (VERIFIED-HASH)
+        run: |
+          BUILT="$(solana-verify get-executable-hash target/deploy/blocfone_market.so)"
+          WANT="$(tr -d '[:space:]' < VERIFIED-HASH)"
+          echo "built: $BUILT"; echo "want:  $WANT"
+          [ "$BUILT" = "$WANT" ] || { echo "the mirror's bytes differ from the source repo's CI build"; exit 1; }
+
       - name: Upload verified .so (for the on-chain upgrade)
         uses: actions/upload-artifact@v4
         with:
